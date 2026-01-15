@@ -1,0 +1,23 @@
+[
+    {
+        "id": "printer1",
+        "company_id": "PUT-YOUR-COMPANY-ID-HERE",
+        "name": "Cozinha (TCP)",
+        "type": "network",
+        "format": "receipt",
+        "autoPrint": true,
+        "intervalSeconds": 0,
+        "host": "192.168.0.100",
+        "port": 9100
+    },
+    {
+        "id": "printer-a4-1",
+        "company_id": "PUT-YOUR-COMPANY-ID-HERE",
+        "name": "Impressora A4 (Sistema)",
+        "type": "system",
+        "format": "a4",
+        "autoPrint": false,
+        "intervalSeconds": 30,
+        "printerName": "HP_Laser_Office"
+    }
+]
