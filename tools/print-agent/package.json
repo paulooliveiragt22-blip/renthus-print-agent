@@ -1,19 +1,23 @@
 {
-    "name": "renthus-print-agent",
-    "version": "0.1.0",
-    "description": "Agent to auto-print orders for Renthus",
-    "main": "printAgent.advanced.js",
-    "scripts": {
-        "start": "node printAgent.advanced.js"
-    },
-    "dependencies": {
-        "@supabase/supabase-js": "^2.25.0",
-        "express": "^4.18.2",
-        "body-parser": "^1.20.2",
-        "pdfkit": "^0.13.0",
-        "pdf-to-printer": "^4.0.0",
-        "escpos": "^3.0.0",
-        "escpos-usb": "^2.1.0",
-        "bluetooth-serial-port": "^2.2.6"
-    }
+  "name": "renthus-print-agent",
+  "version": "0.1.0",
+  "description": "Agent to auto-print orders for Renthus",
+  "main": "printAgent.advanced.js",
+  "scripts": {
+    "start": "node printAgent.advanced.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.25.0",
+    "body-parser": "^1.20.2",
+    "escpos": "^3.0.0-alpha.6",
+    "escpos-usb": "^3.0.0-alpha.4",
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.7",
+    "pdf-to-printer": "^4.0.0",
+    "pdfkit": "^0.13.0"
+  },
+  "license": "MIT"
 }
