@@ -1,19 +1,50 @@
-// printAgent.advanced.js
+// printAgent.advanced.js (UPDATED)
 // Node 16+
-// Dependências: @supabase/supabase-js express body-parser pdfkit pdf-to-printer escpos escpos-usb bluetooth-serial-port
-// Ajuste o package.json e rode npm install
+// NOTE: This version DOES NOT use a Supabase service key. It talks to the ERP HTTP API
+// via AGENT_KEY. Ensure your ERP implements the endpoints:
+//  GET  ${API_BASE}/jobs/poll
+//  POST ${API_BASE}/jobs/:id/status
+//  (optional) GET ${API_BASE}/printers/:printerId
+//  (optional) GET ${API_BASE}/companies/:companyId/printers
+//
+// Environment:
+//  API_BASE (e.g. https://your-renthus-app.com/api/print)
+//  AGENT_KEY
+//  AGENT_PORT (optional, default 4001)
+//  DEFAULT_PRINTER_CONFIG_PATH (optional)
+//
+/* eslint-disable no-console */
 
 const net = require("net");
 const express = require("express");
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
-const { createClient } = require("@supabase/supabase-js");
 const PDFDocument = require("pdfkit");
-const { print } = require("pdf-to-printer");
+let fetchFn = null;
 
-// Tentativas de importar libs opcionais de hardware:
-let escpos, escposUsb, BluetoothSerialPort;
+// Try to use global fetch (Node 18+). Otherwise use node-fetch.
+try {
+    if (typeof fetch === "function") {
+        fetchFn = fetch.bind(global);
+    } else {
+        // require node-fetch v2 (common)
+        // If you use node-fetch v3 (ESM), adapt accordingly.
+        fetchFn = require("node-fetch");
+    }
+} catch (e) {
+    try {
+        fetchFn = require("node-fetch");
+    } catch (err) {
+        console.error("Please install 'node-fetch' or run on Node 18+ (with global fetch).", err.message);
+        process.exit(1);
+    }
+}
+
+// Optional hardware libraries (best-effort)
+let escpos = null;
+let escposUsb = null;
+let BluetoothSerialPort = null;
 try {
     escpos = require("escpos");
     escposUsb = require("escpos-usb");
@@ -26,70 +57,33 @@ try {
     console.warn("bluetooth-serial-port not installed (Bluetooth printing won't be available) —", e.message);
 }
 
-// CONFIG (env)
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// CONFIG
+const API_BASE = (process.env.API_BASE || "http://localhost:3000/api/print").replace(/\/+$/, "");
+const AGENT_KEY = process.env.AGENT_KEY || "";
 const AGENT_PORT = Number(process.env.AGENT_PORT || 4001);
-const DEFAULT_PRINTER_CONFIG_PATH = path.resolve(process.cwd(), "printers.json");
+const DEFAULT_PRINTER_CONFIG_PATH = path.resolve(process.cwd(), process.env.DEFAULT_PRINTER_CONFIG_PATH || "printers.json");
 
-// Supabase client (use service role)
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("Please set SUPABASE_URL and SUPABASE_KEY");
+if (!AGENT_KEY) {
+    console.error("Please set AGENT_KEY environment variable (agent API key).");
     process.exit(1);
 }
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// In-memory queues and timers per company
-const companyQueues = new Map(); // companyId => { orders: [], timer: NodeTimer|null, intervalSeconds }
-const printedCache = new Set();  // in-memory, optional; persistent check via print_jobs
+// In-memory structures
+const companyQueues = new Map(); // companyId => { processing: Set(jobId) }
+const printedCache = new Set(); // optional local set of printed order ids
 
-// Helper para obter impressoras: tenta DB => fallback para printers.json
-async function getPrintersForCompany(companyId) {
-    // 1) try DB table printers
-    try {
-        const { data, error } = await sb
-            .from("printers")
-            .select("*")
-            .eq("company_id", companyId)
-            .eq("is_active", true);
-        if (!error && Array.isArray(data) && data.length > 0) {
-            // assume config in "config" jsonb field
-            return data.map((r) => ({
-                id: r.id,
-                name: r.name,
-                type: r.type,
-                format: r.format,
-                autoPrint: r.auto_print,
-                intervalSeconds: r.interval_seconds,
-                config: r.config || {},
-            }));
-        }
-    } catch (e) {
-        console.warn("Printers: db fetch error", e.message);
-    }
-
-    // 2) fallback local file
-    try {
-        if (fs.existsSync(DEFAULT_PRINTER_CONFIG_PATH)) {
-            const arr = JSON.parse(fs.readFileSync(DEFAULT_PRINTER_CONFIG_PATH, "utf-8"));
-            return arr.filter((p) => p.company_id === companyId && p.is_active !== false).map((p) => ({
-                id: p.id,
-                name: p.name,
-                type: p.type,
-                format: p.format,
-                autoPrint: p.autoPrint,
-                intervalSeconds: p.intervalSeconds || 0,
-                config: p
-            }));
-        }
-    } catch (e) {
-        console.warn("Printers file error", e.message);
-    }
-
-    return [];
+// Helper: fetch with Authorization
+async function apiFetch(route, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {}, {
+        Authorization: `Bearer ${AGENT_KEY}`,
+    });
+    const url = route.startsWith("http") ? route : `${API_BASE}${route.startsWith("/") ? "" : "/"}${route}`;
+    const res = await fetchFn(url, Object.assign({}, opts, { headers }));
+    return res;
 }
 
-// Build ESC/POS receipt buffer (receipt format)
+// ---- Printing helpers (unchanged behavior) ---- //
+
 function buildReceiptBuffer(order, items) {
     const lines = [];
     const esc = (s) => Buffer.from(String(s || ""), "latin1");
@@ -139,7 +133,6 @@ function buildReceiptBuffer(order, items) {
     return Buffer.concat(lines);
 }
 
-// Build PDF A4 for order using PDFKit
 function buildA4PdfPath(order, items) {
     return new Promise((resolve, reject) => {
         const filename = `order_${order.id}_${Date.now()}.pdf`;
@@ -161,7 +154,6 @@ function buildA4PdfPath(order, items) {
         doc.fontSize(11).text("Itens:");
         doc.moveDown(0.5);
 
-        const tableTop = doc.y;
         const itemLines = items || [];
         itemLines.forEach((it) => {
             doc.text(`${it.product_name || it.name || "(produto)"} x${it.quantity || it.qty || 1}  R$ ${(Number(it.unit_price || it.price || 0)).toFixed(2)}`);
@@ -176,7 +168,6 @@ function buildA4PdfPath(order, items) {
     });
 }
 
-// Print buffer to network TCP
 function printTcp(buffer, host, port = 9100) {
     return new Promise((resolve, reject) => {
         const client = new net.Socket();
@@ -197,7 +188,6 @@ function printTcp(buffer, host, port = 9100) {
     });
 }
 
-// Print buffer via escpos USB (if available)
 async function printUsb(buffer, usbVendorId, usbProductId) {
     if (!escpos || !escposUsb) throw new Error("escpos or escpos-usb not installed");
     const device = new escposUsb(usbVendorId, usbProductId);
@@ -205,19 +195,22 @@ async function printUsb(buffer, usbVendorId, usbProductId) {
     return new Promise((resolve, reject) => {
         device.open((err) => {
             if (err) return reject(err);
-            printer.raw(buffer);
-            // raw writes, we wait a bit then close
+            try {
+                printer.raw(buffer);
+            } catch (err) {
+                // ignore
+            }
+            // wait a bit then close
             setTimeout(() => {
                 try {
                     device.close();
-                } catch { }
+                } catch (e) { }
                 resolve();
             }, 200);
         });
     });
 }
 
-// Print via bluetooth SPP (if library installed)
 async function printBluetooth(buffer, address, channel = 1) {
     if (!BluetoothSerialPort) throw new Error("bluetooth-serial-port not installed");
     return new Promise((resolve, reject) => {
@@ -239,241 +232,324 @@ async function printBluetooth(buffer, address, channel = 1) {
     });
 }
 
-// Print PDF A4 using OS
 async function printPdfA4(filepath, options = {}) {
-    // use pdf-to-printer
+    // pdf-to-printer's print() returns a promise
+    const { print } = require("pdf-to-printer");
     return print(filepath, options);
 }
 
-// Persist print_job record in DB
-async function createPrintJobRecord(companyId, orderId, payload = {}, status = "pending", error = null) {
+// ---- Helpers to obtain printer configs ---- //
+
+async function getPrintersFromFile(companyId) {
     try {
-        await sb.from("print_jobs").insert([{ company_id: companyId, order_id: orderId, status, payload, error }]);
+        if (fs.existsSync(DEFAULT_PRINTER_CONFIG_PATH)) {
+            const arr = JSON.parse(fs.readFileSync(DEFAULT_PRINTER_CONFIG_PATH, "utf-8"));
+            return arr.filter((p) => p.company_id === companyId && p.is_active !== false).map((p) => ({
+                id: p.id,
+                name: p.name,
+                type: p.type,
+                format: p.format,
+                autoPrint: p.autoPrint,
+                intervalSeconds: p.intervalSeconds || 0,
+                config: p
+            }));
+        }
     } catch (e) {
-        console.warn("Could not create print_jobs record:", e.message);
+        console.warn("Printers file error", e.message);
+    }
+    return [];
+}
+
+async function getPrinterFromBackend(printerId) {
+    try {
+        const res = await apiFetch(`/printers/${printerId}`);
+        if (!res.ok) {
+            console.warn("GET /printers/:id failed", res.status);
+            return null;
+        }
+        const json = await res.json();
+        // Expect backend returns printer object { id, name, type, format, config, auto_print... }
+        return json.printer || json || null;
+    } catch (e) {
+        console.warn("Error fetching printer from backend:", e.message);
+        return null;
     }
 }
 
-// Check if order already printed via print_jobs or orders.printed_at
-async function alreadyPrinted(orderId) {
+async function getPrintersForCompany(companyId) {
+    // 1) try backend
     try {
-        const { data } = await sb.from("print_jobs").select("id").eq("order_id", orderId).eq("status", "done").limit(1);
-        if (data && data.length) return true;
-        const { data: orders, error } = await sb.from("orders").select("printed_at").eq("id", orderId).limit(1).single();
-        if (!error && orders && orders.printed_at) return true;
+        const res = await apiFetch(`/companies/${companyId}/printers`);
+        if (res.ok) {
+            const json = await res.json();
+            // Expect backend -> { printers: [...] } or array
+            const arr = Array.isArray(json.printers) ? json.printers : (Array.isArray(json) ? json : (json.data || []));
+            if (arr && arr.length > 0) {
+                return arr.map((r) => ({
+                    id: r.id,
+                    name: r.name,
+                    type: r.type,
+                    format: r.format,
+                    autoPrint: r.auto_print || r.autoPrint,
+                    intervalSeconds: r.interval_seconds || r.intervalSeconds || 0,
+                    config: r.config || {}
+                }));
+            }
+        } else {
+            // continue to file fallback
+        }
     } catch (e) {
-        // ignore - false by default
+        console.warn("Printers: backend fetch error", e.message);
     }
-    return false;
+
+    // 2) fallback local file
+    return await getPrintersFromFile(companyId);
 }
 
-// fetch order + items + customer extras
-async function fetchOrderFull(orderId) {
-    const { data: orderData, error: orderErr } = await sb.from("orders").select("*").eq("id", orderId).limit(1).single();
-    if (orderErr) throw orderErr;
-    const { data: items, error: itemsErr } = await sb.from("order_items").select("*").eq("order_id", orderId);
-    if (itemsErr) console.warn("items fetch err", itemsErr.message);
-    // try to fetch company name
-    let companyName = null;
-    try {
-        const { data: comp } = await sb.from("companies").select("name").eq("id", orderData.company_id).limit(1).single();
-        companyName = comp?.name;
-    } catch (e) { }
-    return { order: { ...orderData, company_name: companyName }, items: items || [] };
-}
+// ---- Print processing ---- //
 
-// Process a single order printing to the provided printer config
 async function processSinglePrint(printer, order, items) {
-    // create job record pending
-    await createPrintJobRecord(order.company_id, order.id, { printer: printer.id }, "pending", null);
-    try {
-        if (printer.format === "receipt") {
-            const buf = buildReceiptBuffer(order, items);
-            if (printer.type === "network") {
-                await printTcp(buf, printer.config.host, printer.config.port || 9100);
-            } else if (printer.type === "usb") {
-                await printUsb(buf, printer.config.usbVendorId, printer.config.usbProductId);
-            } else if (printer.type === "bluetooth") {
-                await printBluetooth(buf, printer.config.btAddress, printer.config.btChannel || 1);
-            } else {
-                throw new Error("Unsupported printer type for receipt: " + printer.type);
-            }
-        } else if (printer.format === "a4") {
-            const pdfPath = await buildA4PdfPath(order, items);
-            // use system print
-            await printPdfA4(pdfPath, { printer: printer.config.printerName });
-            // optional: cleanup file after printing
-            try { fs.unlinkSync(pdfPath); } catch (e) { }
+    // Expect printer to be object { id, type, format, config: {...} }
+    if (!printer) throw new Error("No printer provided");
+
+    if (printer.format === "receipt" || printer.format === "receipt_v1") {
+        const buf = buildReceiptBuffer(order, items);
+        if (printer.type === "network") {
+            await printTcp(buf, printer.config.host, printer.config.port || 9100);
+        } else if (printer.type === "usb") {
+            await printUsb(buf, printer.config.usbVendorId, printer.config.usbProductId);
+        } else if (printer.type === "bluetooth") {
+            await printBluetooth(buf, printer.config.btAddress, printer.config.btChannel || 1);
         } else {
-            throw new Error("Unknown printer format: " + printer.format);
+            throw new Error("Unsupported printer type for receipt: " + printer.type);
         }
-        // mark job done
-        await sb.from("print_jobs").insert([{ company_id: order.company_id, order_id: order.id, status: "done", payload: { printer: printer.id } }]);
-        // update orders.printed_at
-        try {
-            await sb.from("orders").update({ printed_at: new Date().toISOString() }).eq("id", order.id);
-        } catch (e) { }
-        console.log("Printed order", order.id, "on printer", printer.name || printer.id);
-    } catch (err) {
-        console.error("Print error", err.message || err);
-        await sb.from("print_jobs").insert([{ company_id: order.company_id, order_id: order.id, status: "failed", error: String(err) }]);
-        throw err;
-    }
-}
-
-// Process queue for a company: iterate orders and printers
-async function processCompanyQueue(companyId) {
-    const queue = companyQueues.get(companyId);
-    if (!queue || queue.orders.length === 0) return;
-    // fetch printers
-    const printers = await getPrintersForCompany(companyId);
-    if (!printers || printers.length === 0) {
-        console.warn("No printers for company", companyId);
-        return;
-    }
-
-    // drain orders snapshot
-    const ordersToProcess = queue.orders.splice(0, queue.orders.length);
-
-    for (const orderPayload of ordersToProcess) {
-        const orderId = orderPayload.id || orderPayload.order_id;
-        if (!orderId) continue;
-        if (await alreadyPrinted(orderId)) {
-            console.log("Order already printed (db):", orderId);
-            continue;
-        }
-
-        // fetch full
-        let order, items;
-        if (orderPayload.items && orderPayload.items.length) {
-            order = orderPayload;
-            items = orderPayload.items;
-        } else {
-            const r = await fetchOrderFull(orderId);
-            order = r.order;
-            items = r.items;
-        }
-
-        // for each printer for the company (filter by format supported)
-        for (const p of printers) {
-            try {
-                await processSinglePrint(p, order, items);
-            } catch (e) {
-                console.error("Failed to print order", orderId, "on printer", p.id, e.message);
-            }
-        }
-    }
-}
-
-// Enfileira um pedido para uma company e gerencia timers
-async function enqueueOrder(companyId, orderPayload) {
-    if (!companyQueues.has(companyId)) {
-        companyQueues.set(companyId, { orders: [], timer: null, intervalSeconds: 0 });
-        // try to set intervalSeconds from printers
-        const printers = await getPrintersForCompany(companyId);
-        const interval = printers && printers.length ? Math.max(...printers.map(p => p.intervalSeconds || 0)) : 0;
-        companyQueues.get(companyId).intervalSeconds = interval;
-        if (interval && interval > 0) {
-            // set timer
-            const t = setInterval(() => {
-                processCompanyQueue(companyId).catch((e) => console.error(e));
-            }, interval * 1000);
-            companyQueues.get(companyId).timer = t;
-        }
-    }
-
-    const q = companyQueues.get(companyId);
-    q.orders.push(orderPayload);
-
-    // if intervalSeconds == 0 for this company, print immediately
-    if (!q.intervalSeconds || q.intervalSeconds === 0) {
-        // process immediately but avoid blocking realtime handler
-        setImmediate(() => {
-            processCompanyQueue(companyId).catch((e) => console.error(e));
-        });
+    } else if (printer.format === "a4" || printer.format === "pdf") {
+        const pdfPath = await buildA4PdfPath(order, items);
+        // use system print
+        await printPdfA4(pdfPath, { printer: printer.config.printerName });
+        // cleanup
+        try { fs.unlinkSync(pdfPath); } catch (e) { /* ignore */ }
+    } else if (printer.format === "zpl") {
+        // For ZPL, expect printer.type network and payload.zplText
+        if (printer.type !== "network") throw new Error("ZPL printers must be network printers");
+        const zplBuf = Buffer.from(order.zpl || order.zpl_text || "", "utf8");
+        await printTcp(zplBuf, printer.config.host, printer.config.port || 9100);
     } else {
-        // will be processed by timer
-        console.log(`Enqueued order ${orderPayload.id || orderPayload.order_id} for company ${companyId} (will flush every ${q.intervalSeconds}s)`);
+        throw new Error("Unknown printer format: " + printer.format);
     }
 }
 
-// Handler when a new order event arrives
-async function handleNewOrderEvent(payload) {
+// ---- Job handling (polling & status reporting) ---- //
+
+async function reportJobStatus(jobId, status, errorText = null) {
     try {
-        const record = payload; // payload.new if you're tying directly to realtime
-        const orderId = record.id || record.order_id;
-        if (!orderId) return;
-        if (await alreadyPrinted(orderId)) {
-            console.log("Skipping already printed order (db):", orderId);
+        const body = { status };
+        if (errorText) body.error = String(errorText);
+        const res = await apiFetch(`/jobs/${jobId}/status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+            const txt = await res.text().catch(() => "");
+            console.warn("Failed to report job status:", res.status, txt);
+        }
+    } catch (e) {
+        console.warn("reportJobStatus error:", e.message);
+    }
+}
+
+async function processJob(job) {
+    if (!job || !job.id) return;
+    const jobId = job.id;
+    if (companyQueues.has(job.company_id)) {
+        const st = companyQueues.get(job.company_id);
+        if (st.processing && st.processing.has(jobId)) {
+            console.log("Job already processing:", jobId);
             return;
         }
-        // enqueue
-        await enqueueOrder(record.company_id, record);
-    } catch (e) {
-        console.error("handleNewOrderEvent error:", e.message);
+    }
+
+    // Mark as processing locally
+    if (!companyQueues.has(job.company_id)) companyQueues.set(job.company_id, { processing: new Set() });
+    const q = companyQueues.get(job.company_id);
+    q.processing.add(jobId);
+
+    try {
+        // Prefer fully-contained payload
+        const payload = job.payload || {};
+        const order = payload.order || job.order || null;
+        const items = payload.items || job.items || [];
+        let printer = null;
+
+        // Determine printer config:
+        // 1) if payload.printerConfig present -> use it
+        if (payload.printerConfig) {
+            printer = payload.printerConfig;
+        } else if (payload.printer && typeof payload.printer === "object") {
+            // payload.printer may already be full object
+            printer = payload.printer;
+        } else if (payload.printer && (typeof payload.printer === "string" || typeof payload.printer === "number")) {
+            // payload.printer is printerId -> fetch from backend
+            const printerId = String(payload.printer);
+            const p = await getPrinterFromBackend(printerId);
+            if (p) printer = p;
+        }
+
+        // 2) fallback: use default company printer if available
+        if (!printer) {
+            const printers = await getPrintersForCompany(job.company_id);
+            if (printers && printers.length) {
+                // pick default or first
+                printer = printers.find((p) => p.is_default || p.autoPrint) || printers[0];
+            }
+        }
+
+        // 3) If still no printer -> fail job
+        if (!printer) {
+            throw new Error("No printer available for company " + job.company_id);
+        }
+
+        // 4) ensure we have order data
+        if (!order) {
+            // try to extract from payload.orderId/order_id or job.order_id
+            const orderId = payload.orderId || payload.order_id || job.order_id;
+            if (orderId) {
+                // try to fetch from backend (this endpoint may be protected; best practice is for backend to include order in payload)
+                try {
+                    const res = await apiFetch(`${API_BASE.replace(/\/api\/print$/, "")}/api/orders/${orderId}`);
+                    if (res.ok) {
+                        const j = await res.json();
+                        // expect backend returns order + items; adapt if necessary
+                        if (j.order) {
+                            order = j.order;
+                            if (!items || items.length === 0) items = j.items || [];
+                        } else if (j.data) {
+                            order = j.data;
+                        }
+                    } else {
+                        // fallback: if fetching order fails, we continue only if payload had enough info
+                        console.warn("Could not fetch order", orderId, "status", res.status);
+                    }
+                } catch (e) {
+                    console.warn("Fetching order failed:", e.message);
+                }
+            }
+        }
+
+        if (!order) {
+            throw new Error("No order payload available for job " + jobId);
+        }
+
+        // Process the print
+        console.log(`Printing job ${jobId} to printer ${printer.id || printer.name || "(unknown)"}...`);
+        await processSinglePrint(printer, order, items);
+
+        // Report done
+        await reportJobStatus(jobId, "done");
+        // optional local bookkeeping
+        try { printedCache.add(order.id); } catch { }
+        console.log(`Job ${jobId} printed successfully.`);
+    } catch (err) {
+        console.error("Job processing failed:", job.id, err && err.message ? err.message : err);
+        await reportJobStatus(job.id, "failed", err && err.message ? err.message : String(err));
+    } finally {
+        const q2 = companyQueues.get(job.company_id);
+        if (q2 && q2.processing) q2.processing.delete(job.id);
     }
 }
 
-// Start agent
-async function startAgent() {
-    // Start subscriptions to Supabase realtime (using Realtime via sb.channel)
-    const channel = sb.channel("public:orders")
-        .on("postgres_changes", { event: "INSERT", schema: "public", table: "orders" }, (payload) => {
-            console.log("Realtime order insert:", payload);
-            handleNewOrderEvent(payload.new || payload).catch(console.error);
-        })
-        .subscribe((status) => {
-            console.log("Realtime subscribe status:", status);
-        });
-
-    // Express endpoints
-    const app = express();
-    app.use(bodyParser.json());
-
-    // Reprint endpoint
-    app.post("/print-order", async (req, res) => {
-        try {
-            const { orderId } = req.body;
-            if (!orderId) return res.status(400).json({ error: "orderId required" });
-            const { order, items } = await fetchOrderFull(orderId);
-            await enqueueOrder(order.company_id, { ...order, items });
-            res.json({ ok: true });
-        } catch (e) {
-            console.error(e);
-            res.status(500).json({ error: String(e) });
+// Poll loop
+let polling = false;
+async function pollOnce() {
+    try {
+        const res = await apiFetch(`/jobs/poll`);
+        if (!res.ok) {
+            const txt = await res.text().catch(() => "");
+            console.warn("Poll returned", res.status, txt);
+            return;
         }
-    });
-
-    // List printers for company (from DB or config)
-    app.get("/printers/:companyId", async (req, res) => {
-        try {
-            const printers = await getPrintersForCompany(req.params.companyId);
-            res.json({ ok: true, printers });
-        } catch (e) {
-            res.status(500).json({ error: String(e) });
+        const json = await res.json();
+        const jobs = Array.isArray(json.jobs) ? json.jobs : (json.jobs && Array.isArray(json.jobs) ? json.jobs : (Array.isArray(json) ? json : (json.data || [])));
+        if (!jobs || jobs.length === 0) return;
+        for (const job of jobs) {
+            // process sequentially but do not block polling for other companies; we queue per-company
+            processJob(job).catch((e) => console.error("processJob error", e && e.message ? e.message : e));
         }
-    });
-
-    // Manual enqueue (useful for testing)
-    app.post("/enqueue", async (req, res) => {
-        try {
-            const { order } = req.body;
-            if (!order || !order.id || !order.company_id) return res.status(400).json({ error: "order with id and company_id required" });
-            await enqueueOrder(order.company_id, order);
-            res.json({ ok: true });
-        } catch (e) {
-            res.status(500).json({ error: String(e) });
-        }
-    });
-
-    app.listen(AGENT_PORT, () => {
-        console.log(`Print Agent listening on http://localhost:${AGENT_PORT}`);
-    });
-
-    console.log("Print Agent started and listening for new orders...");
+    } catch (e) {
+        console.warn("Poll error:", e.message || e);
+    }
 }
 
-startAgent().catch((e) => {
-    console.error("Agent error", e);
-    process.exit(1);
+async function pollLoop() {
+    if (polling) return;
+    polling = true;
+    let backoff = 1000;
+    while (true) {
+        try {
+            await pollOnce();
+            // normal interval
+            await new Promise((r) => setTimeout(r, 3000));
+            backoff = 1000;
+        } catch (e) {
+            console.error("Poll loop fatal error", e.message || e);
+            await new Promise((r) => setTimeout(r, backoff));
+            backoff = Math.min(60000, backoff * 2);
+        }
+    }
+}
+
+// ---- Local Express server (health / simple API) ---- //
+const app = express();
+app.use(bodyParser.json());
+
+app.get("/health", (req, res) => {
+    res.json({
+        ok: true,
+        agent: true,
+        api_base: API_BASE,
+        agent_port: AGENT_PORT,
+        processing: Array.from(companyQueues.entries()).map(([companyId, st]) => ({
+            companyId,
+            processing: Array.from(st.processing || [])
+        }))
+    });
+});
+
+app.get("/printers-file", (req, res) => {
+    try {
+        if (fs.existsSync(DEFAULT_PRINTER_CONFIG_PATH)) {
+            const arr = JSON.parse(fs.readFileSync(DEFAULT_PRINTER_CONFIG_PATH, "utf-8"));
+            return res.json({ printers: arr });
+        }
+        return res.json({ printers: [] });
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
+    }
+});
+
+app.post("/printers-file", (req, res) => {
+    try {
+        const arr = req.body.printers || req.body;
+        fs.writeFileSync(DEFAULT_PRINTER_CONFIG_PATH, JSON.stringify(arr, null, 2), "utf-8");
+        return res.json({ ok: true });
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
+    }
+});
+
+app.listen(AGENT_PORT, () => {
+    console.log(`Print Agent local API listening at http://localhost:${AGENT_PORT}`);
+    // start polling
+    pollLoop().catch((e) => console.error("pollLoop failed:", e));
+});
+
+// graceful shutdown
+process.on("SIGINT", () => {
+    console.log("Shutting down print agent...");
+    process.exit(0);
+});
+process.on("SIGTERM", () => {
+    console.log("Shutting down print agent...");
+    process.exit(0);
 });
