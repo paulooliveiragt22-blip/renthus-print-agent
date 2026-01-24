@@ -1,18 +1,6 @@
 // printAgent.advanced.js (UPDATED)
 // Node 16+
-// NOTE: This version DOES NOT use a Supabase service key. It talks to the ERP HTTP API
-// via AGENT_KEY. Ensure your ERP implements the endpoints:
-//  GET  ${API_BASE}/jobs/poll
-//  POST ${API_BASE}/jobs/:id/status
-//  (optional) GET ${API_BASE}/printers/:printerId
-//  (optional) GET ${API_BASE}/companies/:companyId/printers
-//
-// Environment:
-//  API_BASE (e.g. https://your-renthus-app.com/api/print)
-//  AGENT_KEY
-//  AGENT_PORT (optional, default 4001)
-//  DEFAULT_PRINTER_CONFIG_PATH (optional)
-//
+// Run: node printAgent.advanced.js
 /* eslint-disable no-console */
 
 const net = require("net");
@@ -21,6 +9,7 @@ const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
 const PDFDocument = require("pdfkit");
+
 let fetchFn = null;
 
 // Try to use global fetch (Node 18+). Otherwise use node-fetch.
@@ -28,8 +17,6 @@ try {
     if (typeof fetch === "function") {
         fetchFn = fetch.bind(global);
     } else {
-        // require node-fetch v2 (common)
-        // If you use node-fetch v3 (ESM), adapt accordingly.
         fetchFn = require("node-fetch");
     }
 } catch (e) {
@@ -59,9 +46,41 @@ try {
 
 // CONFIG
 const API_BASE = (process.env.API_BASE || "http://localhost:3000/api/print").replace(/\/+$/, "");
-const AGENT_KEY = process.env.AGENT_KEY || "";
+let AGENT_KEY = process.env.AGENT_KEY || "";
 const AGENT_PORT = Number(process.env.AGENT_PORT || 4001);
-const DEFAULT_PRINTER_CONFIG_PATH = path.resolve(process.cwd(), process.env.DEFAULT_PRINTER_CONFIG_PATH || "printers.json");
+const DEFAULT_PRINTER_CONFIG_PATH = path.resolve(
+    process.cwd(),
+    process.env.DEFAULT_PRINTER_CONFIG_PATH || "printers.json"
+);
+const ALLOWED_FRONTEND_ORIGIN = process.env.NEXT_PUBLIC_BASE_URL || ""; // used for local printers CORS
+
+// If AGENT_KEY is not set in the environment, try to load a local agent.env file
+if (!AGENT_KEY) {
+    try {
+        const envPath = path.join(process.cwd(), "agent.env");
+        if (fs.existsSync(envPath)) {
+            const envText = fs.readFileSync(envPath, "utf8");
+            envText.split(/\r?\n/).forEach((line) => {
+                if (!line || !line.trim() || line.trim().startsWith("#")) return;
+                const m = line.match(/^\s*([^=]+?)\s*=\s*(.*)\s*$/);
+                if (m) {
+                    const key = m[1].trim();
+                    let val = m[2].trim();
+                    if (
+                        (val.startsWith('"') && val.endsWith('"')) ||
+                        (val.startsWith("'") && val.endsWith("'"))
+                    ) {
+                        val = val.slice(1, -1);
+                    }
+                    process.env[key] = val;
+                }
+            });
+            AGENT_KEY = process.env.AGENT_KEY || AGENT_KEY;
+        }
+    } catch (e) {
+        console.warn("Could not read agent.env:", e && e.message ? e.message : e);
+    }
+}
 
 if (!AGENT_KEY) {
     console.error("Please set AGENT_KEY environment variable (agent API key).");
@@ -71,6 +90,9 @@ if (!AGENT_KEY) {
 // In-memory structures
 const companyQueues = new Map(); // companyId => { processing: Set(jobId) }
 const printedCache = new Set(); // optional local set of printed order ids
+
+// keep last printed times per printerId
+const lastPrintedAt = new Map(); // printerId => timestamp ms
 
 // Helper: fetch with Authorization
 async function apiFetch(route, opts = {}) {
@@ -82,7 +104,7 @@ async function apiFetch(route, opts = {}) {
     return res;
 }
 
-// ---- Printing helpers (unchanged behavior) ---- //
+// ---- Printing helpers ---- //
 
 function buildReceiptBuffer(order, items) {
     const lines = [];
@@ -115,14 +137,14 @@ function buildReceiptBuffer(order, items) {
     (items || []).forEach((it) => {
         const name = (it.product_name || it.name || "").substring(0, 16).padEnd(16, " ");
         const qty = String(it.quantity || it.qty || 1).padStart(3, " ");
-        const price = (Number(it.unit_price || it.price || 0)).toFixed(2).padStart(6, " ");
+        const price = Number(it.unit_price || it.price || 0).toFixed(2).padStart(6, " ");
         lines.push(esc(`${name}${qty} ${price}\n`));
     });
     lines.push(esc("--------------------------------\n"));
 
     // totals
     lines.push(Buffer.from([0x1b, 0x45, 1]));
-    lines.push(esc(`TOTAL: R$ ${(Number(order.total_amount || order.total || 0)).toFixed(2)}\n`));
+    lines.push(esc(`TOTAL: R$ ${Number(order.total_amount || order.total || 0).toFixed(2)}\n`));
     lines.push(Buffer.from([0x1b, 0x45, 0]));
     lines.push(esc("\n"));
 
@@ -138,6 +160,7 @@ function buildA4PdfPath(order, items) {
         const filename = `order_${order.id}_${Date.now()}.pdf`;
         const filepath = path.join(process.cwd(), "tmp", filename);
         fs.mkdirSync(path.dirname(filepath), { recursive: true });
+
         const doc = new PDFDocument({ size: "A4", margin: 40 });
         const stream = fs.createWriteStream(filepath);
         doc.pipe(stream);
@@ -156,11 +179,17 @@ function buildA4PdfPath(order, items) {
 
         const itemLines = items || [];
         itemLines.forEach((it) => {
-            doc.text(`${it.product_name || it.name || "(produto)"} x${it.quantity || it.qty || 1}  R$ ${(Number(it.unit_price || it.price || 0)).toFixed(2)}`);
+            doc.text(
+                `${it.product_name || it.name || "(produto)"} x${it.quantity || it.qty || 1}  R$ ${Number(
+                    it.unit_price || it.price || 0
+                ).toFixed(2)}`
+            );
         });
 
         doc.moveDown();
-        doc.fontSize(12).text(`Total: R$ ${(Number(order.total_amount || order.total || 0)).toFixed(2)}`, { align: "right" });
+        doc.fontSize(12).text(`Total: R$ ${Number(order.total_amount || order.total || 0).toFixed(2)}`, {
+            align: "right",
+        });
 
         doc.end();
         stream.on("finish", () => resolve(filepath));
@@ -197,10 +226,9 @@ async function printUsb(buffer, usbVendorId, usbProductId) {
             if (err) return reject(err);
             try {
                 printer.raw(buffer);
-            } catch (err) {
+            } catch (err2) {
                 // ignore
             }
-            // wait a bit then close
             setTimeout(() => {
                 try {
                     device.close();
@@ -215,27 +243,33 @@ async function printBluetooth(buffer, address, channel = 1) {
     if (!BluetoothSerialPort) throw new Error("bluetooth-serial-port not installed");
     return new Promise((resolve, reject) => {
         const bt = new BluetoothSerialPort();
-        bt.connect(address, channel, () => {
-            bt.write(buffer, (err) => {
-                if (err) {
-                    bt.close();
-                    return reject(err);
-                }
-                setTimeout(() => {
-                    try { bt.close(); } catch { }
-                    resolve();
-                }, 200);
-            });
-        }, (err) => {
-            reject(err || new Error("BT connect error"));
-        });
+        bt.connect(
+            address,
+            channel,
+            () => {
+                bt.write(buffer, (err) => {
+                    if (err) {
+                        bt.close();
+                        return reject(err);
+                    }
+                    setTimeout(() => {
+                        try {
+                            bt.close();
+                        } catch { }
+                        resolve();
+                    }, 200);
+                });
+            },
+            (err) => reject(err || new Error("BT connect error"))
+        );
     });
 }
 
 async function printPdfA4(filepath, options = {}) {
-    // pdf-to-printer's print() returns a promise
     const { print } = require("pdf-to-printer");
-    return print(filepath, options);
+    const opts = {};
+    if (options && options.printer) opts.printer = options.printer;
+    return print(filepath, opts);
 }
 
 // ---- Helpers to obtain printer configs ---- //
@@ -244,15 +278,18 @@ async function getPrintersFromFile(companyId) {
     try {
         if (fs.existsSync(DEFAULT_PRINTER_CONFIG_PATH)) {
             const arr = JSON.parse(fs.readFileSync(DEFAULT_PRINTER_CONFIG_PATH, "utf-8"));
-            return arr.filter((p) => p.company_id === companyId && p.is_active !== false).map((p) => ({
-                id: p.id,
-                name: p.name,
-                type: p.type,
-                format: p.format,
-                autoPrint: p.autoPrint,
-                intervalSeconds: p.intervalSeconds || 0,
-                config: p
-            }));
+            return arr
+                .filter((p) => p.company_id === companyId && p.is_active !== false)
+                .map((p) => ({
+                    id: p.id,
+                    name: p.name,
+                    type: p.type,
+                    format: p.format,
+                    autoPrint: p.autoPrint ?? p.auto_print ?? false,
+                    intervalSeconds: p.intervalSeconds || p.interval_seconds || 0,
+                    is_default: p.is_default ?? p.isDefault ?? false, // ✅ IMPORTANT: keep default flag
+                    config: p.config || p,
+                }));
         }
     } catch (e) {
         console.warn("Printers file error", e.message);
@@ -268,7 +305,6 @@ async function getPrinterFromBackend(printerId) {
             return null;
         }
         const json = await res.json();
-        // Expect backend returns printer object { id, name, type, format, config, auto_print... }
         return json.printer || json || null;
     } catch (e) {
         console.warn("Error fetching printer from backend:", e.message);
@@ -282,21 +318,23 @@ async function getPrintersForCompany(companyId) {
         const res = await apiFetch(`/companies/${companyId}/printers`);
         if (res.ok) {
             const json = await res.json();
-            // Expect backend -> { printers: [...] } or array
-            const arr = Array.isArray(json.printers) ? json.printers : (Array.isArray(json) ? json : (json.data || []));
+            const arr = Array.isArray(json.printers)
+                ? json.printers
+                : Array.isArray(json)
+                    ? json
+                    : json.data || [];
             if (arr && arr.length > 0) {
                 return arr.map((r) => ({
                     id: r.id,
                     name: r.name,
                     type: r.type,
                     format: r.format,
-                    autoPrint: r.auto_print || r.autoPrint,
+                    autoPrint: r.auto_print ?? r.autoPrint ?? false,
                     intervalSeconds: r.interval_seconds || r.intervalSeconds || 0,
-                    config: r.config || {}
+                    is_default: r.is_default ?? r.isDefault ?? false,
+                    config: r.config || {},
                 }));
             }
-        } else {
-            // continue to file fallback
         }
     } catch (e) {
         console.warn("Printers: backend fetch error", e.message);
@@ -309,7 +347,6 @@ async function getPrintersForCompany(companyId) {
 // ---- Print processing ---- //
 
 async function processSinglePrint(printer, order, items) {
-    // Expect printer to be object { id, type, format, config: {...} }
     if (!printer) throw new Error("No printer provided");
 
     if (printer.format === "receipt" || printer.format === "receipt_v1") {
@@ -325,12 +362,11 @@ async function processSinglePrint(printer, order, items) {
         }
     } else if (printer.format === "a4" || printer.format === "pdf") {
         const pdfPath = await buildA4PdfPath(order, items);
-        // use system print
-        await printPdfA4(pdfPath, { printer: printer.config.printerName });
-        // cleanup
-        try { fs.unlinkSync(pdfPath); } catch (e) { /* ignore */ }
+        await printPdfA4(pdfPath, { printer: printer.config.printerName || printer.config.name || printer.name });
+        try {
+            fs.unlinkSync(pdfPath);
+        } catch (e) { }
     } else if (printer.format === "zpl") {
-        // For ZPL, expect printer.type network and payload.zplText
         if (printer.type !== "network") throw new Error("ZPL printers must be network printers");
         const zplBuf = Buffer.from(order.zpl || order.zpl_text || "", "utf8");
         await printTcp(zplBuf, printer.config.host, printer.config.port || 9100);
@@ -339,8 +375,6 @@ async function processSinglePrint(printer, order, items) {
     }
 }
 
-// ---- Job handling (polling & status reporting) ---- //
-
 async function reportJobStatus(jobId, status, errorText = null) {
     try {
         const body = { status };
@@ -348,7 +382,7 @@ async function reportJobStatus(jobId, status, errorText = null) {
         const res = await apiFetch(`/jobs/${jobId}/status`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body)
+            body: JSON.stringify(body),
         });
         if (!res.ok) {
             const txt = await res.text().catch(() => "");
@@ -362,6 +396,7 @@ async function reportJobStatus(jobId, status, errorText = null) {
 async function processJob(job) {
     if (!job || !job.id) return;
     const jobId = job.id;
+
     if (companyQueues.has(job.company_id)) {
         const st = companyQueues.get(job.company_id);
         if (st.processing && st.processing.has(jobId)) {
@@ -370,57 +405,56 @@ async function processJob(job) {
         }
     }
 
-    // Mark as processing locally
     if (!companyQueues.has(job.company_id)) companyQueues.set(job.company_id, { processing: new Set() });
     const q = companyQueues.get(job.company_id);
     q.processing.add(jobId);
 
     try {
-        // Prefer fully-contained payload
         const payload = job.payload || {};
-        const order = payload.order || job.order || null;
-        const items = payload.items || job.items || [];
+        let order = payload.order || job.order || null;
+        let items = payload.items || job.items || [];
         let printer = null;
 
-        // Determine printer config:
-        // 1) if payload.printerConfig present -> use it
         if (payload.printerConfig) {
             printer = payload.printerConfig;
         } else if (payload.printer && typeof payload.printer === "object") {
-            // payload.printer may already be full object
             printer = payload.printer;
         } else if (payload.printer && (typeof payload.printer === "string" || typeof payload.printer === "number")) {
-            // payload.printer is printerId -> fetch from backend
             const printerId = String(payload.printer);
             const p = await getPrinterFromBackend(printerId);
             if (p) printer = p;
         }
 
-        // 2) fallback: use default company printer if available
         if (!printer) {
             const printers = await getPrintersForCompany(job.company_id);
             if (printers && printers.length) {
-                // pick default or first
                 printer = printers.find((p) => p.is_default || p.autoPrint) || printers[0];
             }
         }
 
-        // 3) If still no printer -> fail job
         if (!printer) {
             throw new Error("No printer available for company " + job.company_id);
         }
 
-        // 4) ensure we have order data
+        // interval check (respect printer.intervalSeconds)
+        const now = Date.now();
+        const printerIdKey = printer.id || (printer.name ? `name:${printer.name}` : String(Math.random()));
+        const last = lastPrintedAt.get(printerIdKey) || 0;
+        const intervalMs =
+            (printer.intervalSeconds || (printer.config && printer.config.intervalSeconds) || 0) * 1000;
+        if (intervalMs > 0 && now - last < intervalMs) {
+            console.log(`Skipping print for ${jobId} — printer ${printerIdKey} interval not elapsed`);
+            await reportJobStatus(jobId, "delayed", `Printer interval ${intervalMs}ms not elapsed`);
+            return;
+        }
+
         if (!order) {
-            // try to extract from payload.orderId/order_id or job.order_id
             const orderId = payload.orderId || payload.order_id || job.order_id;
             if (orderId) {
-                // try to fetch from backend (this endpoint may be protected; best practice is for backend to include order in payload)
                 try {
                     const res = await apiFetch(`${API_BASE.replace(/\/api\/print$/, "")}/api/orders/${orderId}`);
                     if (res.ok) {
                         const j = await res.json();
-                        // expect backend returns order + items; adapt if necessary
                         if (j.order) {
                             order = j.order;
                             if (!items || items.length === 0) items = j.items || [];
@@ -428,7 +462,6 @@ async function processJob(job) {
                             order = j.data;
                         }
                     } else {
-                        // fallback: if fetching order fails, we continue only if payload had enough info
                         console.warn("Could not fetch order", orderId, "status", res.status);
                     }
                 } catch (e) {
@@ -441,14 +474,14 @@ async function processJob(job) {
             throw new Error("No order payload available for job " + jobId);
         }
 
-        // Process the print
         console.log(`Printing job ${jobId} to printer ${printer.id || printer.name || "(unknown)"}...`);
         await processSinglePrint(printer, order, items);
 
-        // Report done
         await reportJobStatus(jobId, "done");
-        // optional local bookkeeping
-        try { printedCache.add(order.id); } catch { }
+        try {
+            printedCache.add(order.id);
+        } catch { }
+        lastPrintedAt.set(printerIdKey, Date.now());
         console.log(`Job ${jobId} printed successfully.`);
     } catch (err) {
         console.error("Job processing failed:", job.id, err && err.message ? err.message : err);
@@ -470,10 +503,15 @@ async function pollOnce() {
             return;
         }
         const json = await res.json();
-        const jobs = Array.isArray(json.jobs) ? json.jobs : (json.jobs && Array.isArray(json.jobs) ? json.jobs : (Array.isArray(json) ? json : (json.data || [])));
+        const jobs = Array.isArray(json.jobs)
+            ? json.jobs
+            : json.jobs && Array.isArray(json.jobs)
+                ? json.jobs
+                : Array.isArray(json)
+                    ? json
+                    : json.data || [];
         if (!jobs || jobs.length === 0) return;
         for (const job of jobs) {
-            // process sequentially but do not block polling for other companies; we queue per-company
             processJob(job).catch((e) => console.error("processJob error", e && e.message ? e.message : e));
         }
     } catch (e) {
@@ -488,7 +526,6 @@ async function pollLoop() {
     while (true) {
         try {
             await pollOnce();
-            // normal interval
             await new Promise((r) => setTimeout(r, 3000));
             backoff = 1000;
         } catch (e) {
@@ -503,6 +540,24 @@ async function pollLoop() {
 const app = express();
 app.use(bodyParser.json());
 
+// ✅ CORS middleware (FIXED: OPTIONS + methods + headers)
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+
+    if (origin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    } else {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+    }
+
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+});
+
+
 app.get("/health", (req, res) => {
     res.json({
         ok: true,
@@ -511,8 +566,8 @@ app.get("/health", (req, res) => {
         agent_port: AGENT_PORT,
         processing: Array.from(companyQueues.entries()).map(([companyId, st]) => ({
             companyId,
-            processing: Array.from(st.processing || [])
-        }))
+            processing: Array.from(st.processing || []),
+        })),
     });
 });
 
@@ -538,9 +593,173 @@ app.post("/printers-file", (req, res) => {
     }
 });
 
+// ✅ Select local printer and persist to printers.json (so processJob can pick is_default)
+app.post("/local/printers/select", (req, res) => {
+    try {
+        const body = req.body || {};
+        const companyId = String(body.companyId || body.company_id || "").trim();
+        const printerName = String(body.printerName || body.printer_name || body.name || "").trim();
+
+        if (!companyId || !printerName) {
+            return res.status(400).json({ ok: false, error: "companyId and printerName are required" });
+        }
+
+        let arr = [];
+        if (fs.existsSync(DEFAULT_PRINTER_CONFIG_PATH)) {
+            try {
+                arr = JSON.parse(fs.readFileSync(DEFAULT_PRINTER_CONFIG_PATH, "utf8"));
+                if (!Array.isArray(arr)) arr = [];
+            } catch {
+                arr = [];
+            }
+        }
+
+        // unset previous defaults for this company
+        arr = arr.map((p) => (p.company_id === companyId ? { ...p, is_default: false } : p));
+
+        const id = `win:${printerName}`;
+        const existingIdx = arr.findIndex((p) => p.company_id === companyId && String(p.id) === id);
+
+        const record = {
+            id,
+            company_id: companyId,
+            name: printerName,
+            type: "system",
+            format: "a4",
+            is_active: true,
+            is_default: true,
+            autoPrint: true,
+            intervalSeconds: 0,
+            config: { printerName },
+        };
+
+        if (existingIdx >= 0) {
+            arr[existingIdx] = { ...arr[existingIdx], ...record };
+        } else {
+            arr.push(record);
+        }
+
+        fs.writeFileSync(DEFAULT_PRINTER_CONFIG_PATH, JSON.stringify(arr, null, 2), "utf8");
+        return res.json({ ok: true, selected: record });
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: e.message || String(e) });
+    }
+});
+
+// Local printers listing (robust fallback: Windows PowerShell -> pdf-to-printer -> lpstat)
+app.get("/local/printers", async (req, res) => {
+    try {
+        let list = [];
+
+        // ✅ 1) Windows FIRST: PowerShell Get-Printer (more reliable than pdf-to-printer listing)
+        if (process.platform === "win32") {
+            try {
+                const { spawn } = require("child_process");
+                list = await new Promise((resolve) => {
+                    const ps = spawn(
+                        "powershell.exe",
+                        [
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            "Try { Get-Printer | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue } Catch { exit 0 }",
+                        ],
+                        { windowsHide: true }
+                    );
+
+                    let out = "";
+                    ps.stdout.on("data", (d) => (out += String(d)));
+                    ps.stderr.on("data", () => { });
+                    const done = () => {
+                        const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                        resolve(lines);
+                    };
+                    ps.on("close", done);
+                    ps.on("error", (err) => {
+                        console.warn("PowerShell spawn error:", err && err.message ? err.message : err);
+                        resolve([]);
+                    });
+
+                    // safety timeout
+                    setTimeout(() => {
+                        try {
+                            ps.kill();
+                        } catch { }
+                        resolve([]);
+                    }, 5000);
+                });
+            } catch (e) {
+                console.warn("PowerShell fallback failed:", e && e.message ? e.message : e);
+                list = [];
+            }
+        }
+
+        // 2) Try pdf-to-printer (if installed) — keep as fallback
+        if (!list || list.length === 0) {
+            try {
+                const pdfToPrinter = require("pdf-to-printer");
+                if (pdfToPrinter && typeof pdfToPrinter.getPrinters === "function") {
+                    const raw = await pdfToPrinter.getPrinters();
+                    if (Array.isArray(raw) && raw.length > 0) list = raw;
+                }
+            } catch (e) {
+                console.warn("pdf-to-printer failed to list printers:", e && e.message ? e.message : e);
+            }
+        }
+
+        // 3) Unix fallback: lpstat
+        if ((!list || list.length === 0) && process.platform !== "win32") {
+            try {
+                const { spawn } = require("child_process");
+                list = await new Promise((resolve) => {
+                    const sh = spawn("bash", ["-lc", "lpstat -p 2>/dev/null | awk '{print $2}'"], { windowsHide: true });
+                    let out = "";
+                    sh.stdout.on("data", (d) => (out += String(d)));
+                    sh.stderr.on("data", () => { });
+                    sh.on("close", () => {
+                        const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                        resolve(lines);
+                    });
+                    sh.on("error", () => resolve([]));
+                    setTimeout(() => {
+                        try {
+                            sh.kill();
+                        } catch { }
+                        resolve([]);
+                    }, 4000);
+                });
+            } catch (e) {
+                console.warn("lpstat fallback failed:", e && e.message ? e.message : e);
+                list = [];
+            }
+        }
+
+        // Normalize to array of { id, name }
+        const printers = (Array.isArray(list) ? list : [])
+            .map((n) => {
+                try {
+                    if (!n && n !== 0) return null;
+                    if (typeof n === "string") return { id: String(n), name: n };
+                    if (typeof n === "object") {
+                        const name = n.name || n.Name || n.printerName || n.PrinterName || String(n);
+                        return { id: String(name), name };
+                    }
+                    return { id: String(n), name: String(n) };
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean);
+
+        return res.json({ ok: true, printers });
+    } catch (err) {
+        console.warn("Error listing local printers:", err && err.message ? err.message : err);
+        return res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
+    }
+});
+
 app.listen(AGENT_PORT, () => {
     console.log(`Print Agent local API listening at http://localhost:${AGENT_PORT}`);
-    // start polling
     pollLoop().catch((e) => console.error("pollLoop failed:", e));
 });
 
